@@ -1,0 +1,39 @@
+# Compiled Kratel binaries
+/kratel
+/kratel.exe
+/dist/
+/build/
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go test & coverage artifacts
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Local SQLite database files & WAL/SHM journals
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+*.sqlite3
+/backups/
+
+# Temporary & OS files
+/tmp/
+.DS_Store
+Thumbs.db
+MASIDEA.md
+*~
+*.swp
+*.swo
+
+# IDE / Editor directories
+.idea/
+.vscode/
