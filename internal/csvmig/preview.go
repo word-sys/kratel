@@ -1,20 +1,19 @@
 package csvmig
 
-// CSVPreview holds the analyzed header list, sample rows, detected delimiter,
-// and intelligent auto-mapped column assignments for the interactive CSV Migration Wizard.
+// CSVPreview summarizes a parsed CSV or Excel-pasted TSV payload for the interactive column mapper.
 type CSVPreview struct {
-	DetectedDelimiter string              `json:"detected_delimiter"`
-	TotalRows         int                 `json:"total_rows"`
-	Headers           []string            `json:"headers"`
-	SampleRows        [][]string          `json:"sample_rows"`
-	SuggestedMappings []ColumnMapping     `json:"suggested_mappings"`
-	SupportedTargets  []TargetFieldOption `json:"supported_targets"`
+	DetectedDelimiter string            `json:"detected_delimiter"`
+	Headers           []string          `json:"headers"`
+	SampleRows        [][]string        `json:"sample_rows"`
+	TotalRows         int               `json:"total_rows"`
+	SuggestedMapping  map[string]string `json:"suggested_mapping"`
+	AvailableFields   []FieldOption     `json:"available_fields"`
 }
 
-// AnalyzeCSV parses raw CSV/TSV bytes (from file upload or Excel/Google Sheets clipboard paste),
-// detects delimiter and BOM, extracts up to 10 sample rows, and proposes automatic column mappings.
-func AnalyzeCSV(data []byte, forcedDelim rune) (*CSVPreview, error) {
-	headers, rows, delim, err := ParseCSVBytes(data, forcedDelim)
+// AnalyzeCSV parses raw CSV or pasted TSV bytes, returning detected headers, up to 10 sample rows,
+// total data row count, detected delimiter, and intelligent column mapping suggestions.
+func AnalyzeCSV(raw []byte, forcedDelimiter rune) (*CSVPreview, error) {
+	headers, rows, delim, err := ParseTable(raw, forcedDelimiter)
 	if err != nil {
 		return nil, err
 	}
@@ -24,20 +23,14 @@ func AnalyzeCSV(data []byte, forcedDelim rune) (*CSVPreview, error) {
 		sampleLimit = len(rows)
 	}
 	samples := make([][]string, sampleLimit)
-	for i := 0; i < sampleLimit; i++ {
-		normalized := make([]string, len(headers))
-		for col := 0; col < len(headers) && col < len(rows[i]); col++ {
-			normalized[col] = rows[i][col]
-		}
-		samples[i] = normalized
-	}
+	copy(samples, rows[:sampleLimit])
 
 	return &CSVPreview{
-		DetectedDelimiter: DelimiterLabel(delim),
-		TotalRows:         len(rows),
+		DetectedDelimiter: string(delim),
 		Headers:           headers,
 		SampleRows:        samples,
-		SuggestedMappings: AutoMapHeaders(headers),
-		SupportedTargets:  SupportedTargetFields,
+		TotalRows:         len(rows),
+		SuggestedMapping:  SuggestColumnMapping(headers),
+		AvailableFields:   AvailableTargetFields(),
 	}, nil
 }

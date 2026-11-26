@@ -5,11 +5,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/word-sys/kratel/internal/catalog"
 	"github.com/word-sys/kratel/internal/num"
 )
 
-// DuplicatePolicy controls how the CSV importer handles rows whose SKU or Barcode already exists in Kratel.
+// DuplicatePolicy controls how the CSV importer handles rows whose SKU or Barcode already exists.
 type DuplicatePolicy string
 
 const (
@@ -18,12 +17,12 @@ const (
 	PolicyAddStock DuplicatePolicy = "ADD_STOCK"
 )
 
-// ValidatedRow holds the normalized, parsed values and any validation errors/warnings for a single CSV row.
-type ValidatedRow struct {
-	RowNumber        int               `json:"row_number"` // 1-based spreadsheet row (header = row 1, first data row = row 2)
+// MappedRow holds validated, typed fields extracted from one spreadsheet row.
+type MappedRow struct {
+	RowNumber        int               `json:"row_number"`
 	SKU              string            `json:"sku"`
 	Barcode          string            `json:"barcode"`
-	Alias            string            `json:"alias"`
+	AliasCode        string            `json:"alias_code"`
 	Name             string            `json:"name"`
 	Description      string            `json:"description"`
 	Category         string            `json:"category"`
@@ -36,144 +35,208 @@ type ValidatedRow struct {
 	LotNumber        string            `json:"lot_number"`
 	ExpiryDate       string            `json:"expiry_date"`
 	Attributes       map[string]string `json:"attributes"`
-	AttributesJSON   string            `json:"attributes_json"`
-	Warnings         []string          `json:"warnings,omitempty"`
-	Errors           []string          `json:"errors,omitempty"`
 }
 
-// HasErrors reports whether this CSV row has one or more blocking validation errors.
-func (r ValidatedRow) HasErrors() bool {
-	return len(r.Errors) > 0
+// RowIssue describes a row-level validation error or warning during CSV dry-run or commit.
+type RowIssue struct {
+	RowNumber int    `json:"row_number"`
+	Severity  string `json:"severity"` // "ERROR" or "WARNING"
+	Field     string `json:"field"`
+	Message   string `json:"message"`
 }
 
-// ValidateRows applies user-confirmed column mappings across all parsed CSV data rows,
-// parsing fixed-point Millis quantities/costs, validating optional dates, routing extra columns
-// into attributes_json, and flagging row-level errors or within-file duplicates.
-func ValidateRows(headers []string, rows [][]string, mappings []ColumnMapping) ([]ValidatedRow, int) {
-	out := make([]ValidatedRow, 0, len(rows))
+// ValidateRows maps every raw CSV row according to columnMapping, parsing fixed-point quantities/costs,
+// routing custom columns into Attributes, and returning all valid rows alongside structured issues.
+func ValidateRows(headers []string, rows [][]string, columnMapping map[string]string, mapUnmappedToAttributes bool) ([]MappedRow, []RowIssue) {
+	if len(columnMapping) == 0 {
+		columnMapping = SuggestColumnMapping(headers)
+	}
+
+	var (
+		validRows []MappedRow
+		issues    []RowIssue
+	)
+
 	seenSKUs := make(map[string]int, len(rows))
 	seenBarcodes := make(map[string]int, len(rows))
-	errorRows := 0
 
-	for i, rawRow := range rows {
-		vr := ValidatedRow{
-			RowNumber:  i + 2,
+	for idx, rawRow := range rows {
+		rowNum := idx + 2 // 1-indexed spreadsheet line number (header is line 1)
+		mr := MappedRow{
+			RowNumber:  rowNum,
 			Unit:       "pcs",
 			Attributes: make(map[string]string),
 		}
 
-		for _, m := range mappings {
-			if m.TargetField == FieldIgnore || m.TargetField == "" {
+		rowHasError := false
+
+		for colIdx, header := range headers {
+			if colIdx >= len(rawRow) {
 				continue
 			}
-			if m.ColumnIndex < 0 || m.ColumnIndex >= len(rawRow) {
-				continue
-			}
-			val := strings.TrimSpace(rawRow[m.ColumnIndex])
+			val := strings.TrimSpace(rawRow[colIdx])
 			if val == "" {
 				continue
 			}
 
-			switch m.TargetField {
+			target, mapped := columnMapping[header]
+			if !mapped && mapUnmappedToAttributes {
+				target = FieldAttribute
+			}
+
+			switch target {
+			case FieldIgnore:
+				if mapUnmappedToAttributes {
+					mr.Attributes[header] = val
+				}
 			case FieldSKU:
-				vr.SKU = val
+				mr.SKU = val
 			case FieldBarcode:
-				vr.Barcode = val
-			case FieldAlias:
-				vr.Alias = val
+				mr.Barcode = val
+			case FieldAliasCode:
+				mr.AliasCode = val
 			case FieldName:
-				vr.Name = val
+				mr.Name = val
 			case FieldDescription:
-				vr.Description = val
+				mr.Description = val
 			case FieldCategory:
-				vr.Category = val
+				mr.Category = val
 			case FieldUnit:
-				vr.Unit = val
+				mr.Unit = val
 			case FieldLocationCode:
-				vr.LocationCode = val
+				mr.LocationCode = val
 			case FieldSupplierName:
-				vr.SupplierName = val
+				mr.SupplierName = val
 			case FieldLotNumber:
-				vr.LotNumber = val
+				mr.LotNumber = val
 			case FieldExpiryDate:
-				if _, err := time.Parse("2006-01-02", val); err != nil {
-					vr.Errors = append(vr.Errors, fmt.Sprintf("invalid expiry_date %q (expected YYYY-MM-DD)", val))
+				parsedDate, err := normalizeCSVDate(val)
+				if err != nil {
+					issues = append(issues, RowIssue{
+						RowNumber: rowNum,
+						Severity:  "ERROR",
+						Field:     FieldExpiryDate,
+						Message:   fmt.Sprintf("invalid expiry date %q (expected YYYY-MM-DD)", val),
+					})
+					rowHasError = true
 				} else {
-					vr.ExpiryDate = val
+					mr.ExpiryDate = parsedDate
 				}
 			case FieldMinStock:
-				parsed, err := num.ParseNonNegativeMillis("min_stock", val)
+				m, err := num.ParseNonNegativeMillis(FieldMinStock, val)
 				if err != nil {
-					vr.Errors = append(vr.Errors, fmt.Sprintf("invalid min_stock %q", val))
+					issues = append(issues, RowIssue{
+						RowNumber: rowNum,
+						Severity:  "ERROR",
+						Field:     FieldMinStock,
+						Message:   fmt.Sprintf("invalid min_stock %q: %v", val, err),
+					})
+					rowHasError = true
 				} else {
-					vr.MinStockMillis = parsed
+					mr.MinStockMillis = m
 				}
 			case FieldUnitCost:
-				parsed, err := num.ParseNonNegativeMillis("unit_cost", val)
+				cleanedCost := stripCommonCurrencySymbols(val)
+				m, err := num.ParseNonNegativeMillis(FieldUnitCost, cleanedCost)
 				if err != nil {
-					vr.Errors = append(vr.Errors, fmt.Sprintf("invalid unit_cost %q", val))
+					issues = append(issues, RowIssue{
+						RowNumber: rowNum,
+						Severity:  "ERROR",
+						Field:     FieldUnitCost,
+						Message:   fmt.Sprintf("invalid unit_cost %q: %v", val, err),
+					})
+					rowHasError = true
 				} else {
-					vr.UnitCostMillis = parsed
+					mr.UnitCostMillis = m
 				}
 			case FieldOpeningQty:
-				parsed, err := num.ParseNonNegativeMillis("opening_qty", val)
+				m, err := num.ParseNonNegativeMillis(FieldOpeningQty, val)
 				if err != nil {
-					vr.Errors = append(vr.Errors, fmt.Sprintf("invalid opening_qty %q", val))
+					issues = append(issues, RowIssue{
+						RowNumber: rowNum,
+						Severity:  "ERROR",
+						Field:     FieldOpeningQty,
+						Message:   fmt.Sprintf("invalid opening_qty %q: %v", val, err),
+					})
+					rowHasError = true
 				} else {
-					vr.OpeningQtyMillis = parsed
+					mr.OpeningQtyMillis = m
 				}
 			case FieldAttribute:
-				key := strings.TrimSpace(m.AttributeKey)
-				if key == "" && m.ColumnIndex < len(headers) {
-					key = strings.TrimSpace(headers[m.ColumnIndex])
-				}
-				if key != "" {
-					vr.Attributes[key] = val
-				}
+				mr.Attributes[header] = val
 			}
 		}
 
-		// Require Name (or fall back to SKU if Name is missing and SKU is present, emitting a warning)
-		if vr.Name == "" {
-			if vr.SKU != "" {
-				vr.Name = vr.SKU
-				vr.Warnings = append(vr.Warnings, "missing item name; defaulted to SKU")
+		if mr.Name == "" && mr.SKU != "" {
+			mr.Name = mr.SKU
+			issues = append(issues, RowIssue{
+				RowNumber: rowNum,
+				Severity:  "WARNING",
+				Field:     FieldName,
+				Message:   "missing item name; defaulted to SKU",
+			})
+		}
+
+		if mr.Name == "" && mr.SKU == "" {
+			issues = append(issues, RowIssue{
+				RowNumber: rowNum,
+				Severity:  "ERROR",
+				Field:     FieldName,
+				Message:   "row must contain at least an item name or SKU",
+			})
+			rowHasError = true
+		}
+
+		if mr.SKU != "" {
+			skuKey := strings.ToUpper(mr.SKU)
+			if prevRow, dup := seenSKUs[skuKey]; dup {
+				issues = append(issues, RowIssue{
+					RowNumber: rowNum,
+					Severity:  "WARNING",
+					Field:     FieldSKU,
+					Message:   fmt.Sprintf("duplicate SKU %q also appears on row %d", mr.SKU, prevRow),
+				})
 			} else {
-				vr.Errors = append(vr.Errors, "item name is required")
+				seenSKUs[skuKey] = rowNum
 			}
 		}
 
-		if vr.SKU != "" {
-			key := strings.ToUpper(vr.SKU)
-			if prevRow, dup := seenSKUs[key]; dup {
-				vr.Warnings = append(vr.Warnings, fmt.Sprintf("duplicate SKU %q also appears in row %d", vr.SKU, prevRow))
+		if mr.Barcode != "" {
+			bcKey := strings.ToUpper(mr.Barcode)
+			if prevRow, dup := seenBarcodes[bcKey]; dup {
+				issues = append(issues, RowIssue{
+					RowNumber: rowNum,
+					Severity:  "WARNING",
+					Field:     FieldBarcode,
+					Message:   fmt.Sprintf("duplicate barcode %q also appears on row %d", mr.Barcode, prevRow),
+				})
 			} else {
-				seenSKUs[key] = vr.RowNumber
+				seenBarcodes[bcKey] = rowNum
 			}
 		}
 
-		if vr.Barcode != "" {
-			key := strings.ToUpper(vr.Barcode)
-			if prevRow, dup := seenBarcodes[key]; dup {
-				vr.Errors = append(vr.Errors, fmt.Sprintf("duplicate barcode %q already appears in row %d", vr.Barcode, prevRow))
-			} else {
-				seenBarcodes[key] = vr.RowNumber
-			}
+		if !rowHasError {
+			validRows = append(validRows, mr)
 		}
-
-		attrsJSON, cleanedAttrs, attrErr := catalog.NormalizeAttributes("", vr.Attributes)
-		if attrErr != nil {
-			vr.Errors = append(vr.Errors, attrErr.Error())
-		} else {
-			vr.AttributesJSON = attrsJSON
-			vr.Attributes = cleanedAttrs
-		}
-
-		if vr.HasErrors() {
-			errorRows++
-		}
-		out = append(out, vr)
 	}
 
-	return out, errorRows
+	return validRows, issues
+}
+
+func stripCommonCurrencySymbols(raw string) string {
+	s := strings.TrimSpace(raw)
+	for _, sym := range []string{"$", "€", "£", "₺", "¥", "USD", "EUR", "TRY", "GBP", "TL"} {
+		s = strings.ReplaceAll(s, sym, "")
+	}
+	return strings.TrimSpace(s)
+}
+
+func normalizeCSVDate(raw string) (string, error) {
+	s := strings.TrimSpace(raw)
+	for _, layout := range []string{"2006-01-02", "2006/01/02", "02.01.2006", "02/01/2006"} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t.Format("2006-01-02"), nil
+		}
+	}
+	return "", fmt.Errorf("unrecognized date format")
 }
